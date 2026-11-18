@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AevumPay — tUSD8 invoice escrow on QDay Aevum testnet</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; } h2 { font-size: 1.1rem; margin-top: 2rem; }
+  input, button { font-size: 1rem; padding: .5rem; margin: .25rem 0; }
+  input { width: 100%; box-sizing: border-box; }
+  button { cursor: pointer; }
+  .card { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+  .mono { font-family: monospace; word-break: break-all; font-size: .85rem; }
+  #log { white-space: pre-wrap; background: #f6f6f6; padding: .75rem; border-radius: 6px; font-size: .85rem; }
+  .warn { background: #fff8e1; border: 1px solid #f0c36d; padding: .75rem; border-radius: 6px; }
+</style>
+</head>
+<body>
+<h1>AevumPay</h1>
+<p>Invoice escrow for <b>tUSD8</b> stablecoin payments on the QDay <b>Aevum testnet</b> (chain ID 44005). Testnet only — tUSD8 has no real value.</p>
+<div class="warn">Flow: create invoice → approve tUSD8 → fund (escrow) → confirm delivery (release to merchant). Expired funded invoices can be refunded by the payer.</div>
+
+<div class="card">
+  <button id="connect">Connect wallet</button>
+  <p id="account" class="mono">Not connected.</p>
+  <p>Contract: <span id="contract" class="mono">—</span></p>
+  <p>tQDAY: <span id="gasBal">—</span> · tUSD8: <span id="tokenBal">—</span> · escrow tUSD8: <span id="escrowBal">—</span></p>
+  <p><a id="explorerLink" href="https://explorer-test.qday.info" target="_blank" rel="noopener">Open explorer ↗</a></p>
+</div>
+
+<div class="card">
+  <h2>1. Create invoice</h2>
+  <input id="merchant" placeholder="Merchant address (0x…)">
+  <input id="amount" placeholder="Amount in tUSD8, e.g. 0.50">
+  <input id="expiry" placeholder="Expiry in seconds, e.g. 3600" value="3600">
+  <input id="memo" placeholder="Memo, e.g. order-001" value="order-001">
+  <button id="create">Create invoice</button>
+</div>
+
+<div class="card">
+  <h2>2. Fund invoice</h2>
+  <input id="fundId" placeholder="Invoice id">
+  <button id="approve">Approve tUSD8</button>
+  <button id="fund">Fund (escrow)</button>
+</div>
+
+<div class="card">
+  <h2>3. Settle invoice</h2>
+  <input id="settleId" placeholder="Invoice id">
+  <button id="confirm">Confirm delivery (release)</button>
+  <button id="refund">Refund (after expiry)</button>
+  <button id="cancel">Cancel (unfunded only)</button>
+  <button id="read">Read invoice</button>
+  <p id="invoiceOut" class="mono"></p>
+</div>
+
+<h2>Log</h2>
+<div id="log"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/ethers@6.13.5/dist/ethers.umd.min.js"></script>
+<script>
+// >>> Deployed addresses (Aevum testnet, chain 44005). Filled in after deploy. <<<
+const PAY_ADDRESS = "0x0000000000000000000000000000000000000000"; // TODO: AevumPay
+const TUSD8 = "0x456569838f1d43009A91ebA4263147Afd7233483";
+const CHAIN_ID = 44005;
+const RPC = "https://rpc-test.qday.info";
+const EXPLORER = "https://explorer-test.qday.info";
+
+const PAY_ABI = [
+  "function createInvoice(address merchant, uint256 amount, uint256 expirySeconds, string memo) returns (uint256)",
+  "function fundInvoice(uint256 id)",
+  "function confirmDelivery(uint256 id)",
+  "function refundInvoice(uint256 id)",
+  "function cancelInvoice(uint256 id)",
+  "function getInvoice(uint256 id) view returns (tuple(uint256 id, address payer, address merchant, uint256 amount, uint256 expiresAt, uint8 status, string memo))",
+  "function nextInvoiceId() view returns (uint256)"
+];
+const ERC20_ABI = [
+  "function approve(address spender, uint256 amount) returns (bool)",
+  "function balanceOf(address a) view returns (uint256)",
+  "function allowance(address o, address s) view returns (uint256)"
+];
+const STATUS = ["Created", "Funded", "Released", "Refunded", "Cancelled"];
+
+const $ = (id) => document.getElementById(id);
+const log = (m) => { $("log").textContent += m + "\n"; };
+let provider, signer, account, pay, token;
+
+async function ensureNetwork() {
+  const net = await provider.getNetwork();
+  if (Number(net.chainId) !== CHAIN_ID) {
+    await window.ethereum.request({ method: "wallet_addEthereumChain", params: [{
+      chainId: "0xABE5", chainName: "QDay Aevum", rpcUrls: [RPC],
+      nativeCurrency: { name: "tQDAY", symbol: "tQDAY", decimals: 18 },
+      blockExplorerUrls: [EXPLORER] }] });
+  }
+}
+
+$("connect").onclick = async () => {
+  try {
+    provider = new ethers.BrowserProvider(window.ethereum);
+    await provider.send("eth_requestAccounts", []);
+    await ensureNetwork();
+    signer = await provider.getSigner();
+    account = await signer.getAddress();
+    pay = new ethers.Contract(PAY_ADDRESS, PAY_ABI, signer);
+    token = new ethers.Contract(TUSD8, ERC20_ABI, signer);
+    $("account").textContent = "Connected: " + account;
+    $("contract").textContent = PAY_ADDRESS;
+    $("explorerLink").href = EXPLORER + "/address/" + PAY_ADDRESS;
+    await refresh();
+    log("Connected " + account);
+  } catch (e) { log("Connect failed: " + (e.reason || e.message)); }
+};
+
+async function refresh() {
+  if (!provider || !account) return;
+  $("gasBal").textContent = ethers.formatEther(await provider.getBalance(account));
+  $("tokenBal").textContent = ethers.formatUnits(await token.balanceOf(account), 6);
+  $("escrowBal").textContent = ethers.formatUnits(await token.balanceOf(PAY_ADDRESS), 6);
+}
+
+async function tx(promise, label) {
+  const t = await promise;
+  log(label + " sent: " + t.hash);
+  await t.wait();
+  log(label + " confirmed: " + EXPLORER + "/tx/" + t.hash);
+  await refresh();
+  return t;
+}
+
+$("create").onclick = async () => {
+  try {
+    const amount = ethers.parseUnits($("amount").value, 6);
+    const t = await tx(pay.createInvoice($("merchant").value, amount, BigInt($("expiry").value), $("memo").value), "createInvoice");
+    const rc = await provider.getTransactionReceipt(t.hash);
+    log("Invoice created. Next id counter: " + (await pay.nextInvoiceId()));
+  } catch (e) { log("Create failed: " + (e.reason || e.message)); }
+};
+$("approve").onclick = async () => {
+  try {
+    const inv = await pay.getInvoice(BigInt($("fundId").value));
+    await tx(token.approve(PAY_ADDRESS, inv.amount), "approve");
+  } catch (e) { log("Approve failed: " + (e.reason || e.message)); }
+};
+$("fund").onclick = async () => {
+  try { await tx(pay.fundInvoice(BigInt($("fundId").value)), "fundInvoice"); }
+  catch (e) { log("Fund failed: " + (e.reason || e.message)); }
+};
+$("confirm").onclick = async () => {
+  try { await tx(pay.confirmDelivery(BigInt($("settleId").value)), "confirmDelivery"); }
+  catch (e) { log("Confirm failed: " + (e.reason || e.message)); }
+};
+$("refund").onclick = async () => {
+  try { await tx(pay.refundInvoice(BigInt($("settleId").value)), "refundInvoice"); }
+  catch (e) { log("Refund failed: " + (e.reason || e.message)); }
+};
+$("cancel").onclick = async () => {
+  try { await tx(pay.cancelInvoice(BigInt($("settleId").value)), "cancelInvoice"); }
+  catch (e) { log("Cancel failed: " + (e.reason || e.message)); }
+};
+$("read").onclick = async () => {
+  try {
+    const inv = await pay.getInvoice(BigInt($("settleId").value));
+    $("invoiceOut").textContent =
+      `id=${inv.id} payer=${inv.payer} merchant=${inv.merchant}\namount=${ethers.formatUnits(inv.amount, 6)} tUSD8 status=${STATUS[Number(inv.status)]} expires=${new Date(Number(inv.expiresAt) * 1000).toISOString()}\nmemo=${inv.memo}`;
+  } catch (e) { log("Read failed: " + (e.reason || e.message)); }
+};
+</script>
+</body>
+</html>
